@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+
+# Per-Mac configuration (use the example JSON files in a fresh checkout).
+/devices.json
+/handoff.json
+/handoff-work.json
+/ssh-work-package/handoff.json
+
+# SSH credentials and local backup files.
+*.pem
+*.key
+id_ed25519*
+id_rsa*
+*.before-*
+*.previous-*

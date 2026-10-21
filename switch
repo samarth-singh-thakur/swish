@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""Swish: hand off two Bluetooth accessories between Macs over SSH."""
+import argparse
+import contextlib
+import json
+import os
+from pathlib import Path
+import re
+import select
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+
+# The same backend runs locally and in one persistent SSH session. Keeping the
+# session open holds the peer's lock for the entire transaction.
+WORKER = r'''
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+class Error(Exception):
+    pass
+
+def address(value):
+    value = value.replace(':', '-').lower()
+    if not re.fullmatch(r'(?:[0-9a-f]{2}-){5}[0-9a-f]{2}', value):
+        raise Error('Invalid Bluetooth address: ' + value)
+    return value
+
+class Backend:
+    def __init__(self):
+        self.binary = next((p for p in [shutil.which('blueutil'),
+            '/opt/homebrew/bin/blueutil', '/usr/local/bin/blueutil']
+            if p and os.access(p, os.X_OK)), None)
+        if not self.binary:
+            raise Error('blueutil is missing. Run: brew install blueutil')
+
+    def run(self, *args, timeout=10):
+        env = dict(os.environ)
+        # The profiler fallback reports paired=true even for stale pairings.
+        env.pop('BLUEUTIL_USE_SYSTEM_PROFILER', None)
+        try:
+            result = subprocess.run([self.binary, *args], capture_output=True,
+                text=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            raise Error('blueutil timed out: ' + ' '.join(args))
+        except OSError as exc:
+            raise Error('Cannot run blueutil: ' + str(exc))
+        if result.returncode:
+            raise Error(result.stderr.strip() or
+                'blueutil failed (%s): %s. Check Bluetooth permissions.' %
+                (result.returncode, ' '.join(args)))
+        return result.stdout.strip()
+
+    def devices(self):
+        raw = self.run('--paired', '--format', 'json')
+        try:
+            devices = json.loads(raw)
+            if not isinstance(devices, list):
+                raise ValueError()
+            for device in devices:
+                device['address'] = address(device['address'])
+            return devices
+        except (ValueError, KeyError, TypeError):
+            raise Error('Cannot read Bluetooth devices. Enable Bluetooth and grant '
+                'Bluetooth access to your terminal (and the SSH session on the peer).')
+
+    def connected(self, addr):
+        raw = self.run('--is-connected', address(addr))
+        if raw not in ('0', '1'):
+            raise Error('Cannot read Bluetooth connection state for ' + addr)
+        return raw == '1'
+
+    def hello(self):
+        if self.run('--power') != '1':
+            raise Error('Bluetooth is off or unavailable. Enable it and check '
+                'System Settings > Privacy & Security > Bluetooth.')
+        if '--unpair' not in self.run('--help'):
+            raise Error('Update blueutil: brew upgrade blueutil')
+        return {'identity': socket.gethostname() + ':' + str(os.getuid()),
+                'devices': self.devices()}
+
+    def snapshot(self, addresses):
+        return {address(a): self.connected(a) for a in addresses}
+
+    def release(self, addresses):
+        for addr in addresses:
+            addr = address(addr)
+            if self.connected(addr):
+                self.run('--disconnect', addr)
+            if addr in {d['address'] for d in self.devices()}:
+                self.run('--unpair', addr)
+            if self.connected(addr) or addr in {d['address'] for d in self.devices()}:
+                raise Error('Could not release ' + addr)
+        return True
+
+    def claim(self, addresses, timeout=60):
+        addresses = [address(a) for a in addresses]
+        deadline = time.monotonic() + timeout
+        errors = {}
+        while time.monotonic() < deadline:
+            pending = [a for a in addresses if not self.connected(a)]
+            if not pending:
+                return True
+            for addr in pending:
+                try:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    if addr not in {d['address'] for d in self.devices()}:
+                        self.run('--pair', addr, timeout=min(8, remaining))
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0:
+                        self.run('--connect', addr, timeout=min(8, remaining))
+                except Error as exc:
+                    errors[addr] = str(exc)
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
+        missing = [a for a in addresses if not self.connected(a)]
+        if missing:
+            raise Error('Could not connect ' + ', '.join(missing) +
+                '. Wake or power-cycle the accessories. ' +
+                '; '.join(errors.get(a, '') for a in missing))
+        return True
+
+    def call(self, op, **kwargs):
+        if op not in ('hello', 'snapshot', 'release', 'claim'):
+            raise Error('Unknown operation')
+        return getattr(self, op)(**kwargs)
+
+@contextlib.contextmanager
+def locked():
+    directory = Path.home() / 'Library' / 'Caches' / 'Swish'
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (directory / 'handoff.lock').open('a') as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Error('Another switch is already running on this Mac.')
+        yield
+
+def serve():
+    try:
+        with locked():
+            backend = Backend()
+            for line in sys.stdin:
+                try:
+                    request = json.loads(line)
+                    value = backend.call(**request)
+                    response = {'ok': True, 'value': value}
+                except Exception as exc:
+                    response = {'ok': False, 'error': str(exc)}
+                print(json.dumps(response), flush=True)
+    except Exception as exc:
+        print(json.dumps({'ok': False, 'error': str(exc)}), flush=True)
+'''
+_backend = {}
+exec(WORKER, _backend)
+Error = _backend['Error']
+Backend = _backend['Backend']
+address = _backend['address']
+locked = _backend['locked']
+
+
+def peer_address(value):
+    # SSH receives the destination as one argument, never as shell source.
+    if not re.fullmatch(r'(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9_][A-Za-z0-9_.-]*', value):
+        raise argparse.ArgumentTypeError('Use an SSH alias or user@hostname (no spaces/options).')
+    return value
+
+
+class Remote:
+    def __init__(self, peer):
+        self.broken = False
+        command = ('for p in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; '
+                   'do if [ -x "$p" ]; then exec "$p" -u -c ' +
+                   shlex.quote(WORKER + '\nserve()\n') +
+                   '; fi; done; echo "Install Python 3 on the other Mac" >&2; exit 1')
+        self.errors = tempfile.TemporaryFile(mode='w+t')
+        self.process = subprocess.Popen([
+            'ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
+            '-o', 'ConnectionAttempts=1', '-o', 'ServerAliveInterval=5',
+            '-o', 'ServerAliveCountMax=2', peer, command],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.errors,
+            text=True, bufsize=1)
+
+    def call(self, op, **kwargs):
+        if self.broken:
+            raise Error('SSH session is unavailable; the peer state cannot be verified.')
+        try:
+            self.process.stdin.write(json.dumps({'op': op, **kwargs}) + '\n')
+            self.process.stdin.flush()
+            if not select.select([self.process.stdout], [], [], kwargs.get('timeout', 60) + 30)[0]:
+                self.broken = True
+                raise Error('Other Mac stopped responding. Check its connection; run switch status.')
+            line = self.process.stdout.readline()
+            if not line:
+                self.broken = True
+                self.errors.seek(0)
+                raise Error('SSH failed: ' + self.errors.read().strip() +
+                    '\nEnable Remote Login and set up key-based SSH; connect manually once to trust the host.')
+            response = json.loads(line)
+            if not isinstance(response, dict) or not isinstance(response.get('ok'), bool):
+                raise ValueError('Invalid SSH response')
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            self.broken = True
+            self.errors.seek(0)
+            detail = self.errors.read().strip()
+            raise Error('SSH communication failed: ' + (detail or str(exc)) +
+                        '\nCheck Remote Login and key-based SSH to the other Mac.')
+        if not response['ok']:
+            raise Error('Other Mac: ' + response['error'])
+        return response['value']
+
+    def close(self):
+        with contextlib.suppress(BrokenPipeError):
+            self.process.stdin.close()
+        try:
+            self.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+        self.process.stdout.close()
+        self.errors.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def load_config(path):
+    try:
+        data = json.loads(path.read_text())
+        peer_address(data['peer'])
+        data['devices'] = {kind: address(data['devices'][kind])
+                           for kind in ('keyboard', 'trackpad')}
+        if len(set(data['devices'].values())) != 2:
+            raise ValueError('keyboard and trackpad must have different addresses')
+        return data
+    except FileNotFoundError:
+        raise Error('Run switch init --peer yourname@Other-Mac.local first.')
+    except (ValueError, KeyError, TypeError, argparse.ArgumentTypeError) as exc:
+        raise Error('Invalid config at %s: %s' % (path, exc))
+
+
+def discover():
+    devices = Backend().hello()['devices']
+    unnamed = [d for d in devices if not d.get('name') or
+               d['name'].lower().replace(':', '-') == d['address']]
+    if unnamed:
+        # Some Magic Keyboards have an address as their IOBluetooth name. Use
+        # profiler only for labels; it must never determine pairing state.
+        try:
+            result = subprocess.run(['system_profiler', 'SPBluetoothDataType', '-json'],
+                text=True, capture_output=True, timeout=15, check=True)
+            for controller in json.loads(result.stdout).get('SPBluetoothDataType', []):
+                for group in ('device_connected', 'device_not_connected'):
+                    for item in controller.get(group, []):
+                        for name, details in item.items():
+                            addr = address(details.get('device_address', ''))
+                            for device in unnamed:
+                                if device['address'] == addr:
+                                    device['name'] = name
+        except (OSError, subprocess.SubprocessError, ValueError, Error):
+            pass
+    return devices
+
+
+def initialize(args, path):
+    devices = {}
+    detected = None
+    for kind in ('keyboard', 'trackpad'):
+        chosen = getattr(args, kind)
+        if chosen:
+            devices[kind] = address(chosen)
+            continue
+        if detected is None:
+            detected = discover()
+        matches = [d for d in detected if kind in (d.get('name') or '').lower()]
+        if len(matches) != 1:
+            raise Error('Could not uniquely find your %s. Run switch devices, then '
+                        'pass --%s AA:BB:CC:DD:EE:FF.' % (kind, kind))
+        devices[kind] = matches[0]['address']
+    if len(set(devices.values())) != 2:
+        raise Error('Keyboard and trackpad must have different addresses.')
+    if path.exists() and not args.force:
+        raise Error('Config already exists. Use init --force to replace it.')
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.swish-')
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            json.dump({'peer': args.peer, 'devices': devices}, handle, indent=2)
+            handle.write('\n')
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    print('Saved %s\nRun switch doctor to check both Macs before switching.' % path)
+
+
+def direction(local_state, remote_state, requested):
+    if requested:
+        return requested
+    if all(local_state.values()) and not any(remote_state.values()):
+        return 'other'
+    if all(remote_state.values()) and not any(local_state.values()):
+        return 'here'
+    raise Error('Devices are split between Macs or disconnected. Choose '
+                'switch --to here or switch --to other to recover.')
+
+
+def handoff(local, remote, addresses, destination, before_local, before_remote, timeout):
+    source, target = (local, remote) if destination == 'other' else (remote, local)
+    original = before_local if destination == 'other' else before_remote
+    restore = [a for a in addresses if original[a]]
+    target_original = before_remote if destination == 'other' else before_local
+    restore_target = [a for a in addresses if target_original[a]]
+    print('Moving keyboard and trackpad to %s. Tap a key and move the trackpad; '
+          'power-cycle them if needed.' % ('the other Mac' if destination == 'other' else 'this Mac'), flush=True)
+    # An interrupt in the middle of an RPC can desynchronize the protocol. Finish
+    # this bounded transaction, including recovery, even if Ctrl-C is pressed.
+    old_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        try:
+            source.call('release', addresses=addresses)
+            target.call('release', addresses=addresses)  # discard stale link keys
+            target.call('claim', addresses=addresses, timeout=timeout)
+            state = target.call('snapshot', addresses=addresses)
+            if not all(state.values()):
+                raise Error('Destination did not retain both connections.')
+        except Error as exc:
+            print('Handoff failed; attempting to restore the original connections.', file=sys.stderr, flush=True)
+            try:
+                # Never let the old host race the target. If peer cleanup cannot
+                # be verified, report the failure instead of claiming success.
+                target.call('release', addresses=addresses)
+                if restore:
+                    source.call('claim', addresses=restore, timeout=20)
+                if restore_target:
+                    target.call('claim', addresses=restore_target, timeout=20)
+            except Error as recovery:
+                raise Error('%s\nRecovery failed: %s\nUse a built-in keyboard/trackpad '
+                            'or cable, then run switch --to here.' % (exc, recovery))
+            raise Error('%s\nOriginal connections restored. Run switch status.' % exc)
+    finally:
+        signal.signal(signal.SIGINT, old_handler)
+    print('Keyboard and trackpad connected to %s.' %
+          ('the other Mac' if destination == 'other' else 'this Mac'))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, epilog=
+        'No subcommand: toggle the accessories to the other Mac. '
+        'Requires blueutil, Python 3, and key-based SSH. See README.md for setup.')
+    parser.add_argument('--config', type=Path, default=Path.home() / '.config/swish/config.json')
+    parser.add_argument('--to', choices=('here', 'other'), help='explicit destination; useful for recovery')
+    parser.add_argument('--timeout', type=int, default=60, help='connection retry budget in seconds (10–120)')
+    parser.add_argument('--dry-run', action='store_true', help='check both Macs and show destination without changing devices')
+    commands = parser.add_subparsers(dest='command')
+    init = commands.add_parser('init', help='save peer and accessory addresses')
+    init.add_argument('--peer', type=peer_address, required=True)
+    init.add_argument('--keyboard', help='Bluetooth address (auto-detected when omitted)')
+    init.add_argument('--trackpad', help='Bluetooth address (auto-detected when omitted)')
+    init.add_argument('--force', action='store_true')
+    commands.add_parser('devices', help='list local paired accessories')
+    commands.add_parser('status', help='show which Mac has each accessory')
+    commands.add_parser('doctor', help='check dependencies, SSH, Bluetooth access and device state')
+    args = parser.parse_args(argv)
+    if not 10 <= args.timeout <= 120:
+        parser.error('--timeout must be between 10 and 120 seconds')
+    try:
+        if args.command == 'init':
+            initialize(args, args.config.expanduser())
+            return 0
+        if args.command == 'devices':
+            for device in discover():
+                print('%s  %-12s %s' % (device['address'],
+                      'connected' if device.get('connected') else 'disconnected', device.get('name') or 'Unnamed'))
+            return 0
+        config = load_config(args.config.expanduser())
+        addresses = list(config['devices'].values())
+        with locked(), Remote(config['peer']) as remote:
+            local = Backend()
+            here, there = local.call('hello'), remote.call('hello')
+            if here['identity'] == there['identity']:
+                raise Error('The SSH peer points to this Mac. Configure the other Mac.')
+            before_local = local.call('snapshot', addresses=addresses)
+            before_remote = remote.call('snapshot', addresses=addresses)
+            if any(before_local[a] and before_remote[a] for a in addresses):
+                raise Error('Both Macs report the same accessory connected. '
+                            'Check Bluetooth access and run switch status again.')
+            if args.command in ('status', 'doctor'):
+                if args.command == 'doctor':
+                    print('OK: blueutil, Python, SSH and Bluetooth are available on both Macs.')
+                for kind, addr in config['devices'].items():
+                    locations = [name for name, state in [('this Mac', before_local),
+                                 ('other Mac', before_remote)] if state[addr]]
+                    print('%-9s %s' % (kind + ':', ' + '.join(locations) or 'disconnected'))
+                return 0
+            destination = direction(before_local, before_remote, args.to)
+            if args.dry_run:
+                print('Would move keyboard and trackpad to %s. No changes made.' % destination)
+                return 0
+            # An explicit request for the current destination is idempotent.
+            chosen, other = (before_local, before_remote) if destination == 'here' else (before_remote, before_local)
+            if all(chosen.values()) and not any(other.values()):
+                print('Keyboard and trackpad are already connected %s.' % destination)
+                return 0
+            handoff(local, remote, addresses, destination, before_local, before_remote, args.timeout)
+        return 0
+    except (Error, OSError) as exc:
+        print('switch: ' + str(exc), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print('\nswitch: cancelled before handoff.', file=sys.stderr)
+        return 130
+
+
+if __name__ == '__main__':
+    sys.exit(main())
