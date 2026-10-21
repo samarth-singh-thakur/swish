@@ -8,6 +8,10 @@ switch send     # send both accessories to the other Mac
 switch status   # show connections on both Macs
 ```
 
+Start with the [step-by-step installation guide](INSTALL.md). It covers finding
+your keyboard and trackpad addresses, discovering each Mac's SSH address, editing
+both JSON configurations, and checking the connection before switching.
+
 Swish releases the accessories on their current Mac, then pairs and connects them
 on the destination over SSH. A physical power-cycle or pairing prompt can still
 be required. In the setup this was tested with, both accessories needed to be
@@ -27,6 +31,9 @@ brew install blueutil python
 ```
 
 ## Install on both Macs
+
+For a walkthrough with example device output, per-Mac SSH settings, and validation
+commands, follow [Installation and configuration](INSTALL.md).
 
 Clone the repository, then install the current scripts outside the Desktop folder
 so remote commands do not need access to Desktop files:
